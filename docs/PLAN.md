@@ -41,6 +41,8 @@ TrueNAS 24.10 공식 문서는 시스템 보호를 위해 기본 root/boot files
 
 필수 도구나 옵션이 없으면 누락 항목을 알려주고 Locate를 시작하지 않는다. 해당 NAS에서 기본 설치만으로 실행된다는 완료 판정도 보류한다. 자동 설치 또는 buffered read로의 자동 전환은 하지 않는다.
 
+`dd`의 버전 확인은 정상 GNU 표기인 `dd (coreutils) <version>`과 `dd (GNU coreutils) <version>`을 허용한다. `--version` 명령의 실패도 함께 검사한다. `GNU coreutils` 문자열이 없다는 이유만으로 기존 `dd`를 거부하지 않는다. 사용자 환경에서 발견된 v0.1.0의 시작 검사 오탐은 v0.1.1에서 수정하고 실제 버전 문자열 fixture로 회귀 검증한다.
+
 최종 배포물은 `disk-locate` 파일 하나다. 사용자가 현재 접속 수단으로 복사하고 다음처럼 실행한다.
 
 ```bash

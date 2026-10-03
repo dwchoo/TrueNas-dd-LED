@@ -369,6 +369,29 @@ test_cli_help_and_version() {
     assert_contains "$result" disk-locate
 }
 
+test_dd_version() {
+    local expected=$1
+    load_program || return
+    MOCK_DD_STATUS=$2
+    MOCK_DD_OUTPUT=$3
+    MOCK_DD_ERROR=${4-}
+    declare -F check_dd >/dev/null || { printf '  check_dd 함수가 없음\n' >&2; return 1; }
+    command() {
+        if [[ $1 == dd ]]; then
+            [[ $# == 2 && $2 == --version ]] || return 99
+            printf '%s\n' "$MOCK_DD_OUTPUT"
+            [[ -z $MOCK_DD_ERROR ]] || printf '%s\n' "$MOCK_DD_ERROR" >&2
+            return "$MOCK_DD_STATUS"
+        fi
+        builtin command "$@"
+    }
+    if [[ $expected == accept ]]; then
+        check_dd
+    else
+        assert_rejected check_dd
+    fi
+}
+
 test_launch_fixed_dd_args() {
     local args argument
     load_program || return
@@ -537,6 +560,16 @@ run_test '번호가 재사용된 교체 디스크 거부' test_revalidation_repl
 run_test 'Serial/WWN/크기/sector/type 개별 변경 거부' test_revalidation_individual_fields
 run_test '실제 CLI help/version' test_cli_help_and_version
 run_test '실제 CLI 잘못된 옵션과 non-TTY 거부' test_cli_invalid_and_non_tty
+run_test 'GNU dd 9.1 실제 버전 banner 허용' test_dd_version accept 0 $'dd (coreutils) 9.1\nversion fixture detail'
+run_test 'GNU dd 9.5 실제 버전 banner 허용' test_dd_version accept 0 $'dd (coreutils) 9.5\nversion fixture detail'
+run_test '기존 GNU coreutils 표기 허용' test_dd_version accept 0 $'dd (GNU coreutils) 8.32\nversion fixture detail'
+run_test 'BSD dd 버전 옵션 오류 거부' test_dd_version reject 1 '' $'dd: illegal option -- -\nusage: dd [operands ...]'
+run_test 'BusyBox dd banner 거부' test_dd_version reject 0 $'BusyBox v1.36.1\nUsage: dd [if=FILE] [of=FILE]'
+run_test '버전 옵션 오류 문자열 거부' test_dd_version reject 0 "dd: unrecognized option '--version'"
+run_test '뒤쪽 GNU 문구로 dd를 오인하지 않음' test_dd_version reject 0 $'dd (BSD) 1.0\nGNU coreutils compatibility wrapper'
+run_test 'GNU dd 9.1 banner라도 실패 exitstatus 거부' test_dd_version reject 1 'dd (coreutils) 9.1'
+run_test '기존 GNU banner라도 실패 exitstatus 거부' test_dd_version reject 1 'dd (GNU coreutils) 8.32'
+run_test '빈 dd 버전 출력 거부' test_dd_version reject 0 ''
 run_test 'dd 출력 고정/direct/FD 상속 인자' test_launch_fixed_dd_args
 run_test '재검증 도중 signal 후 burst 시작 금지' test_signal_during_revalidation
 run_test '일반 사용자 Locate가 FD를 열기 전에 거부됨' test_unprivileged_read_rejection

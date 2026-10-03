@@ -2,7 +2,7 @@
 
 TrueNAS SCALE에서 대상 디스크에 읽기 I/O를 발생시켜 Hot-swap Bay의 Activity LED로 물리 위치를 확인하는 CLI/TUI 도구다. 프로그램명은 `disk-locate`다.
 
-버전 `0.1.0`은 단일 Bash 스크립트로 메뉴형 TUI와 CLI를 제공한다. macOS에서 모의 자동검증 36개가 통과했다. 실제 TrueNAS 장치의 기본 도구, raw device 읽기 및 LED 동작은 아직 검증하지 않았다. 검증 범위와 실기 확인 항목은 [검증 기록](docs/VALIDATION.md)에 정리한다.
+버전 `0.1.1`은 단일 Bash 스크립트로 메뉴형 TUI와 CLI를 제공한다. macOS에서 Bash 구문 검사와 모의 회귀 검증 35개가 통과했다. 실제 TrueNAS 장치의 기본 도구, raw device 읽기 및 LED 동작은 아직 검증하지 않았다. 버전별 검증 범위와 실기 확인 항목은 [검증 기록](docs/VALIDATION.md)에 정리한다.
 
 ## 대상 환경
 
@@ -81,3 +81,7 @@ sudo /bin/bash /mnt/tank/scripts/disk-locate /dev/sdc
 - Ctrl+C 시 새 읽기를 중단하고 이 도구가 생성한 프로세스를 정리한다. 고장 장치의 kernel I/O 대기로 종료가 지연되면 남은 PID를 표시하고 다른 디스크 읽기를 시작하지 않는다.
 
 세부 설계, 단계별 검증, 완료 기준은 [구현 계획](docs/PLAN.md)에 정리했다.
+
+## 시작 검사 오류
+
+v0.1.0에서 `dd`가 있어도 `GNU dd가 필요합니다`라는 오류가 발생할 수 있다. 정상 GNU 버전 표기인 `dd (coreutils)`를 시작 검사에서 잘못 거부한 문제이며, v0.1.1에서 수정했다. v0.1.1 파일로 교체하면 되며, 추가 패키지 설치는 필요하지 않다.
