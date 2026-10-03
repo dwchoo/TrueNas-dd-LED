@@ -84,4 +84,8 @@ launch_burst() {
     printf 'CHILD %s %s\n' "$ACTIVE_PID" "$SELECT_SERIAL" >> "$DISK_TEST_TRACE"
 }
 
+# 실제 30분을 기다리지 않고 유휴 만료 경계를 통과시키는 개발용 clock 전진.
+trap 'SECONDS=$((SECONDS + IDLE_MINUTES * 60))' USR1
+trap 'SECONDS=$((SECONDS + IDLE_MINUTES * 60 - 5))' USR2
+
 main "$@"

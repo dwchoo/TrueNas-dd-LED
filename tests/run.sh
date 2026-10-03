@@ -138,7 +138,164 @@ test_args_defaults() {
     parse_args || return
     assert_eq tui "$MODE" || return
     assert_eq 64 "$READ_MIB" || return
-    assert_eq 1 "$INTERVAL"
+    assert_eq 1 "$INTERVAL" || return
+    assert_eq 30 "$IDLE_MINUTES" || return
+    assert_eq 60 "$LOCATE_SECONDS"
+}
+
+test_time_options() {
+    load_program || return
+    parse_args --idle-timeout 15 --duration=45 || return
+    assert_eq tui "$MODE" || return
+    assert_eq 15 "$IDLE_MINUTES" || return
+    assert_eq 45 "$LOCATE_SECONDS" || return
+    parse_args --idle-timeout=1440 --duration 3600 SN-A || return
+    assert_eq locate "$MODE" || return
+    assert_eq 1440 "$IDLE_MINUTES" || return
+    assert_eq 3600 "$LOCATE_SECONDS" || return
+    parse_args --idle-timeout 1 --duration 1 || return
+    assert_eq 1 "$IDLE_MINUTES" || return
+    assert_eq 1 "$LOCATE_SECONDS"
+}
+
+test_time_options_invalid() {
+    load_program || return
+    local option value
+    for option in --idle-timeout --duration; do
+        assert_rejected parse_args "$option" || return
+        for value in 0 -1 01 1.5 100000000000000000000 '1+1' '1;echo injected' ''; do
+            assert_rejected parse_args "$option=$value" || return
+        done
+    done
+    assert_rejected parse_args --idle-timeout 1441 || return
+    assert_rejected parse_args --duration 3601
+}
+
+test_idle_boundary() {
+    load_program || return
+    IDLE_MINUTES=1
+    touch_activity
+    SECONDS=$((LAST_ACTIVITY + 59))
+    check_idle >/dev/null || return
+    assert_eq 0 "$SHUTDOWN" || return
+    SECONDS=$((LAST_ACTIVITY + 60))
+    assert_rejected check_idle || return
+    assert_eq 1 "$SHUTDOWN" || return
+    assert_eq 1 "$STOP_REQUESTED" || return
+    assert_eq 0 "$EXIT_CODE" || return
+    assert_contains "$STOP_REASON" '자동 종료'
+}
+
+test_idle_activity_reset() {
+    load_program || return
+    IDLE_MINUTES=1
+    touch_activity
+    SECONDS=$((LAST_ACTIVITY + 59))
+    touch_activity
+    SECONDS=$((LAST_ACTIVITY + 59))
+    check_idle >/dev/null || return
+    assert_eq 0 "$SHUTDOWN" || return
+    screen_header >/dev/null
+    SECONDS=$((LAST_ACTIVITY + 59))
+    check_idle >/dev/null || return
+    assert_eq 0 "$SHUTDOWN"
+}
+
+test_idle_active_work() {
+    load_program || return
+    RUNNING=1
+    LAST_ACTIVITY=0 SECONDS=1801
+    check_idle >/dev/null || return
+    assert_eq 0 "$SHUTDOWN" || return
+    RUNNING=0
+    touch_activity
+    check_idle >/dev/null || return
+    assert_eq 0 "$SHUTDOWN"
+}
+
+test_countdown() {
+    load_program || return
+    local result
+    LOCATE_SECONDS=60 LAST_ACTIVITY=0 SECONDS=12
+    result=$(show_progress '읽는 중' 2)
+    assert_contains "$result" '남은 50초' || return
+    assert_eq 0 "$LAST_ACTIVITY" || return
+    SECONDS=100
+    result=$(show_progress '쉬는 중' 2)
+    assert_contains "$result" '남은 0초' || return
+    assert_eq 0 "$LAST_ACTIVITY"
+}
+
+test_duration_after_revalidation() {
+    load_program || return
+    collect_disks || return
+    select_target SN-A || return
+    require_root() { return 0; }
+    open_selected_device() { exec 3</dev/null; FD_OPEN=1; }
+    revalidate_target() {
+        TEST_REVALIDATIONS=$((TEST_REVALIDATIONS + 1))
+        if (( TEST_REVALIDATIONS == 2 )); then SECONDS=$((SECONDS + LOCATE_SECONDS)); fi
+    }
+    launch_burst() { TEST_BURSTS=$((TEST_BURSTS + 1)); }
+    TEST_REVALIDATIONS=0 TEST_BURSTS=0
+    run_locate >/dev/null 2>&1 || return
+    assert_eq 1 "$LOCATE_EXPIRED" || return
+    assert_eq 0 "$TEST_BURSTS" || return
+    assert_eq 0 "$FD_OPEN"
+}
+
+test_duration_cleanup() {
+    load_program || return
+    collect_disks || return
+    select_target SN-A || return
+    require_root() { return 0; }
+    open_selected_device() { exec 3</dev/null; FD_OPEN=1; }
+    fd_position() { printf '0\n'; }
+    child_running() { builtin kill -0 "$1" 2>/dev/null; }
+    launch_burst() { /bin/sleep 30 & ACTIVE_PID=$!; TEST_READ_PID=$ACTIVE_PID; TEST_BURSTS=$((TEST_BURSTS + 1)); }
+    poll_controls() { SECONDS=$((SECONDS + LOCATE_SECONDS)); }
+    TEST_BURSTS=0
+    run_locate >/dev/null 2>&1 || return
+    assert_eq 1 "$TEST_BURSTS" || return
+    assert_eq 1 "$LOCATE_EXPIRED" || return
+    assert_eq 0 "$SHUTDOWN" || return
+    assert_eq 0 "$FD_OPEN" || return
+    assert_contains "$STOP_REASON" '식별 시간 제한(60초)' || return
+    if builtin kill -0 "$TEST_READ_PID" 2>/dev/null; then
+        builtin kill -KILL "$TEST_READ_PID" 2>/dev/null || :
+        wait "$TEST_READ_PID" 2>/dev/null || :
+        printf '  전체 시간 만료 후 읽기 자식이 남음\n' >&2
+        return 1
+    fi
+}
+
+test_duration_before_launch() {
+    load_program || return
+    collect_disks || return
+    select_target SN-A || return
+    require_root() { return 0; }
+    open_selected_device() { exec 3</dev/null; FD_OPEN=1; }
+    fd_position() { printf '0\n'; }
+    show_progress() { SECONDS=$((SECONDS + LOCATE_SECONDS)); }
+    launch_burst() { TEST_BURSTS=$((TEST_BURSTS + 1)); }
+    TEST_BURSTS=0
+    run_locate >/dev/null 2>&1 || return
+    assert_eq 1 "$LOCATE_EXPIRED" || return
+    assert_eq 0 "$TEST_BURSTS" || return
+    assert_eq 0 "$FD_OPEN"
+}
+
+test_restart_revalidation() {
+    load_program || return
+    collect_disks || return
+    select_target SN-A || return
+    require_root() { return 0; }
+    LOCATE_EXPIRED=1 TEST_RAW_OPENS=0
+    DEVICE_NUMBER_OVERRIDE=8:99
+    open_selected_device() { TEST_RAW_OPENS=$((TEST_RAW_OPENS + 1)); }
+    assert_rejected run_locate || return
+    assert_eq 0 "$TEST_RAW_OPENS" || return
+    assert_eq 0 "$LOCATE_EXPIRED"
 }
 
 test_args_cli_modes() {
@@ -541,6 +698,16 @@ fi
 
 "$TEST_BASH" -n "$PROGRAM" || exit 1
 run_test '인자 없음의 TUI 기본값' test_args_defaults
+run_test '시간 설정 기본값/최소/최대와 CLI/TUI 옵션' test_time_options
+run_test '시간 설정 숫자 외 값/누락/범위/overflow 거부' test_time_options_invalid
+run_test '유휴 시간 경계에서 정상 자동 종료' test_idle_boundary
+run_test '입력 활동과 화면 전환 후 유휴 시간 초기화' test_idle_activity_reset
+run_test '작업 중 유휴 종료 억제와 작업 후 새 대기' test_idle_active_work
+run_test '남은 시간 표시와 음수 방지 및 유휴 시간 보존' test_countdown
+run_test '장치 재검증 중 시간 만료 후 burst 시작 금지' test_duration_after_revalidation
+run_test '전체 작업 시간 만료 시 정상 중단과 자식/FD 정리' test_duration_cleanup
+run_test '출력 지연 중 만료되면 dd 실행 직전에 읽기 금지' test_duration_before_launch
+run_test '재시작 전 교체 장치 거부와 만료 상태 초기화' test_restart_revalidation
 run_test 'CLI 모드와 읽기 옵션' test_args_cli_modes
 run_test '옵션만 지정한 TUI' test_args_option_only_tui
 run_test '잘못된 옵션 및 범위 거부' test_args_invalid

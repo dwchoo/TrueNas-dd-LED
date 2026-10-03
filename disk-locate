@@ -1,9 +1,11 @@
 #!/bin/bash
 # TrueNAS SCALE용 읽기 전용 Activity LED 식별 도구.
 
-VERSION=0.1.1
+VERSION=0.2.0
 READ_MIB=64
 INTERVAL=1
+IDLE_MINUTES=30 LOCATE_SECONDS=60 LAST_ACTIVITY=0 LOCATE_EXPIRED=0
+PROGRESS_SECOND=-1 PROGRESS_PHASE=
 MODE=tui
 TARGET=
 DISK_NAMES=() DISK_SIZES=() DISK_MODELS=() DISK_SERIALS=() DISK_WWNS=()
@@ -43,8 +45,11 @@ disk-locate — TrueNAS SCALE 디스크 Activity LED 식별
 옵션:
   --read-size 1M..64M                 burst 크기 (기본 64 MiB)
   --interval 1..10                    읽기 완료 후 휴지 시간 (기본 1초)
+  --idle-timeout 1..1440              유휴 자동 종료 시간 (기본 30분)
+  --duration 1..3600                  식별 1회 최대 시간 (기본 60초)
 
-TUI: 번호+Enter로 선택, r 새로고침, s 시작, b 돌아가기, q 중단/종료.
+TUI: 번호+Enter로 선택, r 새로고침, t 시간 설정, s 시작/다시 식별, b 목록, q 중단/종료.
+식별 시간 만료 후 s를 눌러야 새 작업을 시작하며, 실행 중 남은 초를 표시합니다.
 식별 중 Ctrl+C는 TUI 목록으로 복귀하며 CLI에서는 프로그램을 종료합니다.
 식별에는 root 권한이 필요합니다. 디스크는 읽기 전용, 출력은 /dev/null입니다.
 ZFS 상태를 변경하지 않습니다. 식별 종료와 ZFS 상태 확인 후 교체하세요.
@@ -52,18 +57,18 @@ HELP
 }
 
 parse_args() {
-    MODE=tui TARGET= READ_MIB=64 INTERVAL=1
+    MODE=tui TARGET= READ_MIB=64 INTERVAL=1 IDLE_MINUTES=30 LOCATE_SECONDS=60
     local arg value
     while (( $# )); do
         arg=$1; shift
         case $arg in
             --help|-h) MODE=help; return 0 ;;
             --version) MODE=version; return 0 ;;
-            --read-size|--interval)
+            --read-size|--interval|--idle-timeout|--duration)
                 (( $# )) || { error "$arg 값이 필요합니다."; return 2; }
                 value=$1; shift
                 ;;
-            --read-size=*|--interval=*) value=${arg#*=}; arg=${arg%%=*} ;;
+            --read-size=*|--interval=*|--idle-timeout=*|--duration=*) value=${arg#*=}; arg=${arg%%=*} ;;
             --*|if=*|of=*|bs=*|count=*|conv=*|iflag=*|oflag=*)
                 error "지원하지 않는 인자입니다: $(safe_text "$arg")"; return 2 ;;
             *)
@@ -81,10 +86,54 @@ parse_args() {
                     error '--interval은 1부터 10까지 정수 초입니다.'; return 2;
                 }
                 INTERVAL=$value ;;
+            --idle-timeout|--duration)
+                set_time_limit "$arg" "$value" || return 2 ;;
         esac
     done
     [[ -z $TARGET ]] || MODE=locate
     [[ $TARGET != list ]] || MODE=list
+}
+
+set_time_limit() {
+    local option=$1 value=$2 maximum unit
+    case $option in
+        --idle-timeout) maximum=1440 unit=분 ;;
+        --duration) maximum=3600 unit=초 ;;
+        *) return 2 ;;
+    esac
+    if [[ ! $value =~ ^[1-9][0-9]*$ ]] || (( ${#value} > 4 )); then
+        error "$option 값은 1부터 ${maximum}까지 정수 ${unit}입니다."; return 2
+    fi
+    if (( value > maximum )); then
+        error "$option 값은 1부터 ${maximum}까지 정수 ${unit}입니다."; return 2
+    fi
+    case $option in --idle-timeout) IDLE_MINUTES=$value ;; --duration) LOCATE_SECONDS=$value ;; esac
+}
+
+touch_activity() { LAST_ACTIVITY=$SECONDS; }
+check_idle() {
+    (( ! SHUTDOWN && ! RUNNING )) || return 0
+    if (( SECONDS - LAST_ACTIVITY >= IDLE_MINUTES * 60 )); then
+        SHUTDOWN=1 STOP_REQUESTED=1
+        STOP_REASON="입력·상태 변화 없이 ${IDLE_MINUTES}분 경과: 자동 종료"
+        printf '\n%s\n' "$STOP_REASON"
+        return 1
+    fi
+}
+check_duration() {
+    if (( SECONDS - $1 >= LOCATE_SECONDS )); then
+        LOCATE_EXPIRED=1 STOP_REQUESTED=1 STOP_REASON="식별 시간 제한(${LOCATE_SECONDS}초) 도달"
+        return 1
+    fi
+}
+show_progress() {
+    local phase=$1 elapsed=$((SECONDS - $2)) remaining
+    remaining=$((LOCATE_SECONDS - elapsed))
+    (( remaining >= 0 )) || remaining=0
+    if [[ $PROGRESS_PHASE != "$phase" ]] || (( PROGRESS_SECOND != elapsed )); then
+        printf '\r%s | 남은 %s초 | 경과 %s초 | %s MiB / 휴지 %s초    ' "$phase" "$remaining" "$elapsed" "$READ_MIB" "$INTERVAL"
+        PROGRESS_PHASE=$phase PROGRESS_SECOND=$elapsed
+    fi
 }
 
 # lsblk --pairs의 \xHH만 해석한다. 값은 shell 코드로 실행하지 않는다.
@@ -303,7 +352,7 @@ show_details() {
         [[ $label != NAME ]] || label=Device
         printf '%-8s : %s\n' "$label" "$(safe_text "${value:-UNKNOWN}")"
     done
-    printf '읽기 설정: %s MiB / 휴지 %s초\n' "$READ_MIB" "$INTERVAL"
+    printf '읽기 설정: %s MiB / 휴지 %s초 / 최대 %s초\n' "$READ_MIB" "$INTERVAL" "$LOCATE_SECONDS"
     if [[ $SELECT_POOL == UNKNOWN || $SELECT_STATE == UNKNOWN ]]; then
         printf 'ZFS 상태가 미확인입니다. 교체 판단은 TrueNAS에서 확인하세요.\n'
     fi
@@ -396,10 +445,11 @@ read_key() {
     local status
     IFS= read -r -s -n 1 -t "$KEY_TIMEOUT" KEY
     status=$?
-    (( status != 0 )) || KEY_READY=1
+    if (( status == 0 )); then KEY_READY=1; touch_activity; fi
     if (( status == 1 && BASH_VERSINFO[0] >= 4 )); then
         SHUTDOWN=1 STOP_REQUESTED=1 STOP_REASON='입력이 종료되었습니다.'
     fi
+    check_idle || :
     return 0
 }
 poll_controls() {
@@ -454,28 +504,37 @@ install_traps() {
 
 run_locate() {
     local before after burst_start started status result=0
+    LOCATE_EXPIRED=0
     (( ! SHUTDOWN )) || return 1
     require_root || return 1
     revalidate_target || return 1
     STOP_REQUESTED=0 STOP_REASON= RUNNING=1
     if ! open_selected_device; then RUNNING=0; cleanup_work; return 1; fi
     started=$SECONDS
+    touch_activity
+    PROGRESS_SECOND=-1 PROGRESS_PHASE=
     printf '\n식별 시작: %s / Serial %s\n' "$SELECT_NAME" "$(safe_text "${SELECT_SERIAL:-UNKNOWN}")"
     printf '중단: %s\n' "$([[ $MODE == tui ]] && printf 'q 또는 Ctrl+C' || printf 'Ctrl+C')"
     while (( ! STOP_REQUESTED && ! SHUTDOWN )); do
+        check_duration "$started" || break
         revalidate_target || { STOP_REASON='장치 소실 또는 식별 정보 변경'; result=1; break; }
         (( ! STOP_REQUESTED && ! SHUTDOWN )) || break
+        check_duration "$started" || break
         before=$(fd_position) || { STOP_REASON='읽기 위치 확인 실패'; result=1; break; }
         (( ! STOP_REQUESTED && ! SHUTDOWN )) || break
+        check_duration "$started" || break
         if (( before + READ_MIB * 1048576 > SELECT_SIZE )); then STOP_REASON='디스크 읽기 범위 끝'; break; fi
-        printf '\r읽는 중 | 경과 %s초 | %s MiB / 휴지 %s초    ' "$((SECONDS-started))" "$READ_MIB" "$INTERVAL"
+        show_progress '읽는 중' "$started"
         burst_start=$SECONDS
         (( ! STOP_REQUESTED && ! SHUTDOWN )) || break
+        check_duration "$started" || break
         launch_burst || break
         while child_running "$ACTIVE_PID" && (( ! STOP_REQUESTED && ! SHUTDOWN )); do
+            check_duration "$started" || break
             if (( SECONDS - burst_start >= 10 )); then
                 STOP_REQUESTED=1 STOP_REASON='읽기 시간 제한(10초) 초과'; result=1; break
             fi
+            show_progress '읽는 중' "$started"
             poll_controls
         done
         (( ! STOP_REQUESTED && ! SHUTDOWN )) || break
@@ -484,23 +543,31 @@ run_locate() {
         after=$(fd_position) || { STOP_REASON='읽기 위치 확인 실패'; result=1; break; }
         (( ! STOP_REQUESTED && ! SHUTDOWN )) || break
         if (( after-before != READ_MIB*1048576 )); then STOP_REASON='예상보다 짧은 읽기. 추가 읽기를 중단합니다.'; result=1; break; fi
-        printf '\r쉬는 중 | 경과 %s초 | %s MiB / 휴지 %s초    ' "$((SECONDS-started))" "$READ_MIB" "$INTERVAL"
+        check_duration "$started" || break
+        show_progress '쉬는 중' "$started"
         (( ! STOP_REQUESTED && ! SHUTDOWN )) || break
         command sleep "$INTERVAL" & ACTIVE_PID=$!
-        while child_running "$ACTIVE_PID" && (( ! STOP_REQUESTED && ! SHUTDOWN )); do poll_controls; done
+        while child_running "$ACTIVE_PID" && (( ! STOP_REQUESTED && ! SHUTDOWN )); do
+            check_duration "$started" || break
+            show_progress '쉬는 중' "$started"
+            poll_controls
+        done
         (( ! STOP_REQUESTED && ! SHUTDOWN )) || break
         wait "$ACTIVE_PID"; status=$?; ACTIVE_PID=
         if (( status != 0 )); then STOP_REASON='휴지 작업 오류'; result=1; break; fi
     done
+    (( ! LOCATE_EXPIRED )) || show_progress '시간 만료' "$started"
     printf '\n정리 중...\n'
     cleanup_work || result=1
     RUNNING=0
+    touch_activity
     LAST_MESSAGE="식별 중단: $SELECT_NAME / Serial $(safe_text "${SELECT_SERIAL:-UNKNOWN}") — ${STOP_REASON:-작업 종료}"
     printf '%s\n' "$LAST_MESSAGE"
     return "$result"
 }
 
 screen_header() {
+    touch_activity
     if [[ -t 1 ]]; then
         case ${TERM:-dumb} in xterm*|screen*|tmux*|vt100|linux) printf '\033[2J\033[H' ;; esac
     fi
@@ -516,17 +583,38 @@ menu_input() {
         case $KEY in
             [0-9]) if (( ${#digits} < 6 )); then digits+=$KEY; printf '%s' "$KEY"; fi ;;
             $'\177'|$'\b') if [[ -n $digits ]]; then digits=${digits%?}; printf '\b \b'; fi ;;
-            r|R|q|Q|s|S|b|B) MENU_INPUT=${KEY}; printf '\n'; return 0 ;;
+            r|R|q|Q|s|S|b|B|t|T) MENU_INPUT=${KEY}; printf '\n'; return 0 ;;
             '') if [[ -n $digits ]]; then MENU_INPUT=$digits; printf '\n'; return 0; fi ;;
         esac
     done
     return 1
+}
+time_settings() {
+    local option label maximum
+    while (( ! SHUTDOWN )); do
+        screen_header
+        printf '시간 설정 (이번 실행에만 적용)\n\n'
+        printf '[1] 유휴 자동 종료: %s분\n[2] 식별 1회 최대 시간: %s초\n[b] 목록   [q] 종료\n> ' "$IDLE_MINUTES" "$LOCATE_SECONDS"
+        menu_input || return
+        case $MENU_INPUT in
+            b|B) return 0 ;;
+            q|Q) SHUTDOWN=1; return 0 ;;
+            1) option=--idle-timeout label=분 maximum=1440 ;;
+            2) option=--duration label=초 maximum=3600 ;;
+            *) continue ;;
+        esac
+        printf '\n새 값 입력 (1~%s%s) + Enter   [b] 취소   [q] 종료\n> ' "$maximum" "$label"
+        menu_input || return
+        case $MENU_INPUT in b|B) continue ;; q|Q) SHUTDOWN=1; return 0 ;; esac
+        set_time_limit "$option" "$MENU_INPUT" || printf '설정은 변경되지 않았습니다.\n'
+    done
 }
 run_tui() {
     local i index notice=
     while (( ! SHUTDOWN )); do
         collect_disks || return 1
         screen_header
+        printf '유휴 자동 종료: %s분 | 식별 1회: %s초\n\n' "$IDLE_MINUTES" "$LOCATE_SECONDS"
         [[ -z $LAST_MESSAGE ]] || printf '%s\n\n' "$LAST_MESSAGE"
         [[ -z $notice ]] || printf '%s\n\n' "$notice"
         printf '%-3s %-6s %-10s %-22s %-12s %s\n' '#' DEVICE SIZE SERIAL POOL STATE
@@ -537,19 +625,25 @@ run_tui() {
         done
         (( ${#DISK_NAMES[@]} )) || printf '지원하는 SATA/SAS 디스크가 없습니다.\n'
         [[ -z $INVENTORY_WARNING ]] || printf '\n%s\n' "$INVENTORY_WARNING"
-        (( EUID == 0 )) || printf '\n조회 전용: 식별 시작에는 root 권한이 필요합니다.\n'
-        printf '\n번호 입력 후 Enter   [r] 새로고침   [q] 종료\n> '
+        require_root >/dev/null 2>&1 || printf '\n조회 전용: 식별 시작에는 root 권한이 필요합니다.\n'
+        printf '\n번호 입력 후 Enter   [r] 새로고침   [t] 시간 설정   [q] 종료\n> '
         menu_input || break
-        case $MENU_INPUT in q|Q) break ;; r|R) notice=; continue ;; esac
+        case $MENU_INPUT in
+            q|Q) break ;; r|R) notice=; continue ;;
+            t|T) time_settings; continue ;;
+        esac
         if [[ ! $MENU_INPUT =~ ^[0-9]+$ ]] || (( ${#MENU_INPUT} > 6 )); then notice='올바른 번호를 선택하세요.'; continue; fi
         index=$((10#$MENU_INPUT-1))
         if (( index < 0 || index >= ${#DISK_NAMES[@]} )); then notice='목록 범위의 번호를 선택하세요.'; continue; fi
         if ! select_target "/dev/${DISK_NAMES[index]}" || ! revalidate_target; then notice='선택할 수 없습니다. 디스크 정보를 다시 확인하세요.'; continue; fi
-        notice=
+        notice= LOCATE_EXPIRED=0
         while (( ! SHUTDOWN )); do
             screen_header
             show_details
-            if (( EUID == 0 )); then printf '\n[s] 식별 시작   [b] 목록   [q] 종료\n> '
+            (( ! LOCATE_EXPIRED )) || printf '\n%s\n' "$LAST_MESSAGE"
+            if require_root >/dev/null 2>&1; then
+                if (( LOCATE_EXPIRED )); then printf '\n시간이 끝났습니다. [s] 다시 %s초 식별   [b] 목록   [q] 종료\n> ' "$LOCATE_SECONDS"
+                else printf '\n[s] %s초 식별 시작   [b] 목록   [q] 종료\n> ' "$LOCATE_SECONDS"; fi
             else printf '\n조회 전용: sudo /bin/bash disk-locate로 실행하세요.\n[b] 목록   [q] 종료\n> '; fi
             menu_input || break
             case $MENU_INPUT in
@@ -557,7 +651,11 @@ run_tui() {
                 q|Q) SHUTDOWN=1; break ;;
                 s|S)
                     if ! require_root; then notice='식별 시작에는 root 권한이 필요합니다.'; break; fi
-                    run_locate || notice='식별 작업에 오류가 있었습니다. 위 종료 사유를 확인하세요.'
+                    if run_locate; then
+                        (( ! LOCATE_EXPIRED || SHUTDOWN )) || continue
+                    else
+                        notice='식별 작업에 오류가 있었습니다. 위 종료 사유를 확인하세요.'
+                    fi
                     break ;;
             esac
         done
@@ -576,6 +674,7 @@ main() {
     export PATH LC_ALL=C
     check_runtime || return 1
     install_traps
+    touch_activity
     if [[ $MODE == tui ]]; then run_tui; return $?; fi
     collect_disks || return 1
     [[ $MODE != list ]] || { show_list; return 0; }

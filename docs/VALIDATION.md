@@ -2,13 +2,39 @@
 
 작성일: 2026-10-03
 
+## v0.2.0 유휴 종료와 작업 시간 제한
+
+기본 30분 유휴 종료, 기본 60초 식별 및 남은 초 표시, 명시적 `s` 재시작, TUI·CLI 시간 설정을 구현했다. macOS에서 Bash 회귀 **45개**, PTY/signal 검증 **20개**, 합계 **65개**가 모두 통과했다. 실제 NAS의 raw direct I/O와 LED 실기 검증은 기존과 마찬가지로 미확인이다.
+
+```bash
+/bin/bash -n disk-locate
+/bin/bash -n tests/run.sh
+/bin/bash -n tests/pty-runtime.sh
+/bin/bash tests/run.sh
+python3 -u tests/pty.py
+```
+
+위 명령은 모두 exit status `0`으로 종료했다. 유휴 검증은 테스트용 runtime에서만 사용하는 USR1/USR2 trap으로 Bash `SECONDS`를 전진시켜 30분 경계를 확인했다. 실제 운영 프로그램에는 이 trap이나 검증 우회 옵션이 없다. 작업 시간 만료 PTY는 공개 옵션 `--duration 3`으로 실제 3초 제한을 검증하고, 기본 60초 값과 감독 루프 경계는 Bash 회귀에서 확인했다. 입력 검사·장치 재검증과 정리는 실제 프로그램 함수를 사용하되 raw device 및 `dd`는 모의 구현으로 대체했다.
+
+| 항목 | 확인 결과 |
+| --- | --- |
+| 기본값과 범위 | 유휴 30분·식별 60초, 옵션 최소·최대 및 `--옵션=값`, 숫자 아닌 값·0·overflow·범위 초과 거부 |
+| 유휴 종료 | 목록·상세·시간 설정 값 입력에서 30분 만료로 정상 종료; 동작 없는 일반 키도 입력으로 초기화; 작업 중 유휴 종료 억제 |
+| 전체 작업 시간 | 읽기·휴지 중 만료 시 자식 정리·FD 닫기·새 burst 금지, CLI 정상 종료 |
+| 남은 초 표시 | 읽는 중·쉬는 중 countdown 갱신 및 0 표시, 음수 방지 |
+| 재시작 | 만료 후 자동 읽기 없음, `s` 입력 후 같은 Serial의 새 작업, 장치 변경 시 FD open 전 거부 |
+| 설정 | `t`에서 유휴 분·식별 초 변경 후 목록과 실제 작업에 적용, 범위 밖 값은 기존 설정 유지 |
+| 기존 동작 | 메뉴 선택·새로고침·뒤로·`q`·Ctrl+C, CLI/TUI TERM/HUP 자식 정리, short read·읽기 오류 후 재시도 금지 및 terminal ECHO 복구 |
+
+기존 burst별 10초 timeout도 회귀 검증에서 유지됨을 확인했다. 시간 만료는 사용자 공간에서 중단을 요청하는 한도이며, kernel I/O 대기 장치의 실제 종료 시각을 보장한 결과는 아니다.
+
 ## v0.1.1 시작 검사 수정
 
 사용자가 실제 TrueNAS에서 v0.1.0을 실행했을 때 `dd`가 존재하지만 `GNU dd가 필요합니다`라는 오류가 발생했다. 정상 GNU 버전 문자열의 `dd (coreutils)` 표기를 잘못 거부하는 검사 문제를 v0.1.1에서 수정했다. GNU 버전 banner 허용과 실패 exit status 거부를 포함한 Bash 회귀 검증 35개가 통과했으며, `--version` 출력은 `disk-locate 0.1.1`로 확인했다. Linux raw direct I/O와 LED 실기 검증은 여전히 미확인이다.
 
 개발 환경은 macOS다. 실제 TrueNAS에서의 v0.1.0 시작 오류는 사용자 보고로 확인했으며, 개발 환경에서 실제 TrueNAS SCALE ElectricEel 24.10에 접속해 검증하지는 않았다. fixture와 모의 명령을 사용하는 자동검증은 Linux raw device 동작 및 실제 Activity LED 확인을 대신하지 않는다.
 
-## 개발 환경 자동검증
+## v0.1.1 이전 자동검증 기록
 
 v0.1.1에서 저장소 루트의 다음 명령을 실행했다. 두 파일의 Bash 구문 검사와 회귀 검증 35개가 모두 exit status `0`으로 종료했다.
 
@@ -57,6 +83,8 @@ Python 3는 개발 환경의 PTY 검증에만 사용한다. 테스트용 코드�
 | Activity LED | `--read-size 8M --interval 1`부터 짧게 실행해 대상 베이의 점멸 식별 | 미실행 |
 | SSH 및 TrueNAS Shell TUI | 선택·상세·시작·중단·목록 복귀를 여러 디스크에 반복하고 입력과 echo 정상 확인 | 미실행 |
 | 정상 중단 | 읽기 중과 휴지 중 `q`, Ctrl+C, TERM/HUP 후 새 읽기 중단 및 추적 자식 부재 확인 | 미실행 |
+| 작업 시간 만료 | 기본 60초 countdown 후 중단, `s` 재시작 및 CLI 정상 종료, 시간 설정 변경 반영 | 미실행 |
+| 유휴 종료 | 입력 없는 목록·상세·시간 설정 화면의 기본 30분 종료 및 키 입력 후 초기화 | 미실행 |
 | OFFLINE 유지 | 운영자가 이미 OFFLINE 처리한 장치에서 식별하고 전후 `zpool status`가 OFFLINE 유지 | 미실행 |
 | 배포 경로 보존 | 영속 dataset의 파일로 실행하고 재부팅 후 파일 및 실행 가능 여부 확인 | 미실행 |
 

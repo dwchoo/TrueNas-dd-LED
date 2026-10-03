@@ -216,6 +216,133 @@ def failure_case(session):
         raise AssertionError("읽기 오류 뒤 재시도 또는 읽기 미실행")
 
 
+def wait_launches(session, expected):
+    deadline = time.monotonic() + 3
+    while len(session.launched()) < expected and time.monotonic() < deadline:
+        session.read(0.02)
+    if len(session.launched()) != expected:
+        raise AssertionError(f"읽기 횟수가 다름: {session.launched()}")
+
+
+def duration_restart(session):
+    menu(session)
+    detail(session, 1)
+    session.send("s")
+    session.expect(r"식별 시작")
+    session.expect(r"남은 3초")
+    session.expect(r"남은 [12]초")
+    session.expect(r"남은 0초", timeout=5)
+    session.expect(r"\[s\] 다시 3초 식별")
+    session.assert_children_gone()
+    wait_launches(session, 1)
+    session.read(0.2)
+    if len(session.launched()) != 1:
+        raise AssertionError("시간 만료 후 자동으로 읽기를 다시 시작함")
+    session.send("s")
+    session.expect(r"식별 시작")
+    session.expect(r"남은 3초")
+    wait_launches(session, 2)
+    if [serial for _pid, serial in session.launched()] != ["SN-A", "SN-A"]:
+        raise AssertionError("재시작 대상이 바뀜")
+    session.send("q")
+    menu(session)
+    session.assert_children_gone()
+    session.send("q")
+    if session.wait_exit() != 0:
+        raise AssertionError("재시작 작업 정리 후 종료 실패")
+
+
+def duration_rest(session):
+    menu(session)
+    detail(session, 1)
+    session.send("s")
+    session.expect(r"쉬는 중.*남은 [123]초")
+    session.expect(r"쉬는 중.*남은 [12]초")
+    session.expect(r"\[s\] 다시 3초 식별", timeout=6)
+    session.assert_children_gone()
+    wait_launches(session, 1)
+    session.send("b")
+    menu(session)
+    session.send("2\n")
+    session.expect(r"Device")
+    session.expect(r"\[s\] 3초 식별 시작")
+    session.expect(r"\[b\].*목록")
+    session.send("q")
+    if session.wait_exit() != 0:
+        raise AssertionError("휴지 시간 만료 후 종료 실패")
+
+
+def duration_cli(session):
+    session.expect(r"식별 시작")
+    if session.wait_exit(timeout=6) != 0:
+        raise AssertionError("CLI 전체 시간 만료가 실패로 종료됨")
+    if "식별 시간 제한(3초) 도달" not in session.transcript:
+        raise AssertionError("CLI 전체 시간 만료 사유가 없음")
+    if len(session.launched()) != 1:
+        raise AssertionError("시간 만료 뒤 새 burst 시작")
+
+
+def idle_exit(session, screen):
+    menu(session)
+    if screen == "detail":
+        detail(session, 1)
+    elif screen == "settings":
+        session.send("t")
+        session.expect(r"시간 설정 \(이번 실행에만 적용\)")
+        session.send("1\n")
+        session.expect(r"새 값 입력")
+    os.kill(session.pid, signal.SIGUSR1)
+    session.expect(r"30분 경과: 자동 종료", timeout=4)
+    if session.wait_exit() != 0 or session.launched():
+        raise AssertionError("유휴 종료 시 읽기 실행 또는 오류 발생")
+
+
+def settings_case(session):
+    menu(session)
+    session.send("t")
+    session.expect(r"시간 설정 \(이번 실행에만 적용\)")
+    session.send("1\n")
+    session.expect(r"새 값 입력.*1440분")
+    session.send("0\n")
+    session.expect(r"설정은 변경되지 않았습니다")
+    session.expect(r"유휴 자동 종료: 30분")
+    session.send("1\n")
+    session.expect(r"새 값 입력")
+    session.send("15\n")
+    session.expect(r"유휴 자동 종료: 15분")
+    session.send("2\n")
+    session.expect(r"새 값 입력.*3600초")
+    session.send("3\n")
+    session.expect(r"식별 1회 최대 시간: 3초")
+    session.send("b")
+    session.expect(r"유휴 자동 종료: 15분.*식별 1회: 3초")
+    session.expect(r"번호.*입력")
+    detail(session, 1)
+    session.send("s")
+    session.expect(r"남은 3초")
+    session.expect(r"\[s\] 다시 3초 식별", timeout=6)
+    session.assert_children_gone()
+    session.send("q")
+    if session.wait_exit() != 0:
+        raise AssertionError("TUI 시간 변경 후 종료 실패")
+
+
+def idle_key_reset(session):
+    menu(session)
+    os.kill(session.pid, signal.SIGUSR2)
+    session.read(0.1)
+    session.send("x")  # 메뉴 동작이 없는 키도 실제 입력으로 유휴 시간을 초기화한다.
+    deadline = time.monotonic() + 6
+    while time.monotonic() < deadline:
+        session.read(0.1)
+        if session.status is not None:
+            raise AssertionError("일반 키 입력 후 이전 유휴 만료 시간이 적용됨")
+    os.kill(session.pid, signal.SIGUSR1)
+    session.expect(r"30분 경과: 자동 종료", timeout=4)
+    if session.wait_exit() != 0:
+        raise AssertionError("새 유휴 시간 만료가 정상 종료되지 않음")
+
+
 def run_case(label, callback, args=(), mode="full", burst_sleep="5"):
     with tempfile.TemporaryDirectory(prefix="disk-locate-pty-") as directory:
         session = Session(directory, args, mode, burst_sleep)
@@ -250,6 +377,27 @@ def main():
             f"CLI {mode} 읽기 실패 후 재시도 금지", failure_case,
             args=("SN-A",), mode=mode, burst_sleep="0.05",
         ))
+    results.append(run_case(
+        "TUI 읽기 중 전체 시간 만료/countdown/s 명시적 재시작", duration_restart,
+        args=("--duration", "3"),
+    ))
+    results.append(run_case(
+        "TUI 휴지 중 시간 만료와 다른 디스크의 만료 상태 초기화", duration_rest,
+        args=("--duration", "3", "--interval", "10"), burst_sleep="0.05",
+    ))
+    for burst_sleep in ("5", "0.05"):
+        results.append(run_case(
+            f"CLI 전체 시간 만료 정상 종료 ({burst_sleep})", duration_cli,
+            args=("--duration", "3", "--interval", "10", "SN-A"),
+            burst_sleep=burst_sleep,
+        ))
+    for screen in ("list", "detail", "settings"):
+        results.append(run_case(
+            f"TUI {screen} 화면의 30분 유휴 자동 종료",
+            lambda session, s=screen: idle_exit(session, s),
+        ))
+    results.append(run_case("TUI 시간 설정과 잘못된 값 유지", settings_case))
+    results.append(run_case("TUI 일반 키 입력 후 유휴 만료 시간 초기화", idle_key_reset))
     print(f"\nPTY/signal 통과 {sum(results)} / 실패 {len(results) - sum(results)}")
     return 0 if all(results) else 1
 
