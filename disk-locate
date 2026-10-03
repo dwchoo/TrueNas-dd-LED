@@ -1,0 +1,583 @@
+#!/bin/bash
+# TrueNAS SCALE용 읽기 전용 Activity LED 식별 도구.
+
+VERSION=0.1.0
+READ_MIB=64
+INTERVAL=1
+MODE=tui
+TARGET=
+DISK_NAMES=() DISK_SIZES=() DISK_MODELS=() DISK_SERIALS=() DISK_WWNS=()
+DISK_NUMBERS=() DISK_SECTORS=() DISK_BYIDS=() DISK_POOLS=() DISK_STATES=()
+INVENTORY_WARNING=
+ACTIVE_PID= POLL_PID= FD_OPEN=0 RUNNING=0 STOP_REQUESTED=0 SHUTDOWN=0
+STOP_REASON= EXIT_CODE=0 LAST_MESSAGE= CLEANING=0
+KEY_TIMEOUT=0.1
+(( BASH_VERSINFO[0] >= 4 )) || KEY_TIMEOUT=1
+
+error() { printf '오류: %s\n' "$*" >&2; }
+
+safe_text() {
+    local value=$1 char code i
+    for ((i=0; i<${#value}; i++)); do
+        char=${value:i:1}
+        printf -v code '%d' "'$char"
+        if (( code < 32 || code == 127 )); then
+            printf '\\x%02x' "$code"
+        else
+            printf '%s' "$char"
+        fi
+    done
+}
+
+help() {
+    cat <<'HELP'
+disk-locate — TrueNAS SCALE 디스크 Activity LED 식별
+
+사용법:
+  disk-locate                         메뉴형 TUI
+  disk-locate list                    디스크 목록
+  disk-locate <SERIAL>                정확한 Serial로 식별
+  disk-locate /dev/sdX                전체 디스크 경로로 식별
+  disk-locate --help | --version
+
+옵션:
+  --read-size 1M..64M                 burst 크기 (기본 64 MiB)
+  --interval 1..10                    읽기 완료 후 휴지 시간 (기본 1초)
+
+TUI: 번호+Enter로 선택, r 새로고침, s 시작, b 돌아가기, q 중단/종료.
+식별 중 Ctrl+C는 TUI 목록으로 복귀하며 CLI에서는 프로그램을 종료합니다.
+식별에는 root 권한이 필요합니다. 디스크는 읽기 전용, 출력은 /dev/null입니다.
+ZFS 상태를 변경하지 않습니다. 식별 종료와 ZFS 상태 확인 후 교체하세요.
+HELP
+}
+
+parse_args() {
+    MODE=tui TARGET= READ_MIB=64 INTERVAL=1
+    local arg value
+    while (( $# )); do
+        arg=$1; shift
+        case $arg in
+            --help|-h) MODE=help; return 0 ;;
+            --version) MODE=version; return 0 ;;
+            --read-size|--interval)
+                (( $# )) || { error "$arg 값이 필요합니다."; return 2; }
+                value=$1; shift
+                ;;
+            --read-size=*|--interval=*) value=${arg#*=}; arg=${arg%%=*} ;;
+            --*|if=*|of=*|bs=*|count=*|conv=*|iflag=*|oflag=*)
+                error "지원하지 않는 인자입니다: $(safe_text "$arg")"; return 2 ;;
+            *)
+                [[ -z $TARGET ]] || { error '대상은 하나만 지정하세요.'; return 2; }
+                TARGET=$arg; continue ;;
+        esac
+        case $arg in
+            --read-size)
+                [[ $value =~ ^([1-9]|[1-5][0-9]|6[0-4])M$ ]] || {
+                    error '--read-size는 1M부터 64M까지 정수 MiB입니다.'; return 2;
+                }
+                READ_MIB=${value%M} ;;
+            --interval)
+                [[ $value =~ ^([1-9]|10)$ ]] || {
+                    error '--interval은 1부터 10까지 정수 초입니다.'; return 2;
+                }
+                INTERVAL=$value ;;
+        esac
+    done
+    [[ -z $TARGET ]] || MODE=locate
+    [[ $TARGET != list ]] || MODE=list
+}
+
+# lsblk --pairs의 \xHH만 해석한다. 값은 shell 코드로 실행하지 않는다.
+decode_hex() {
+    local raw=$1 char hex i=0
+    REPLY=
+    while (( i < ${#raw} )); do
+        char=${raw:i:1}
+        if [[ $char == '\' ]]; then
+            [[ ${raw:i+1:1} == x ]] || return 1
+            hex=${raw:i+2:2}
+            [[ $hex =~ ^[[:xdigit:]]{2}$ && $hex != 00 ]] || return 1
+            printf -v char '%b' "\\x$hex"
+            ((i+=4))
+        else
+            ((i+=1))
+        fi
+        REPLY+=$char
+    done
+}
+
+parse_block_row() {
+    local line=$1 pair='^([A-Za-z0-9_:-]+)="([^"]*)"[[:space:]]*' key raw matched
+    ROW_NAME= ROW_TYPE= ROW_SIZE= ROW_MODEL= ROW_SERIAL= ROW_WWN=
+    ROW_NUMBER= ROW_SECTOR=
+    while [[ -n $line ]]; do
+        [[ $line =~ $pair ]] || return 1
+        key=${BASH_REMATCH[1]} raw=${BASH_REMATCH[2]} matched=${BASH_REMATCH[0]}
+        line=${line:${#matched}}
+        decode_hex "$raw" || return 1
+        case $key in
+            NAME) ROW_NAME=$REPLY ;; TYPE) ROW_TYPE=$REPLY ;;
+            SIZE) ROW_SIZE=$REPLY ;; MODEL) ROW_MODEL=$REPLY ;;
+            SERIAL) ROW_SERIAL=$REPLY ;; WWN) ROW_WWN=$REPLY ;;
+            MAJ:MIN|MAJ_MIN) ROW_NUMBER=$REPLY ;;
+            LOG-SEC|LOG_SEC) ROW_SECTOR=$REPLY ;;
+        esac
+    done
+    [[ -n $ROW_NAME && -n $ROW_TYPE ]]
+}
+
+read_block_rows() {
+    command lsblk --bytes --pairs --nodeps --output NAME,TYPE,SIZE,MODEL,SERIAL,WWN,MAJ:MIN,LOG-SEC -- "$@"
+}
+read_pool_status() { command zpool status -LP; }
+canonical_device() { command readlink -e -- "$1"; }
+device_is_block() { [[ -b $1 ]]; }
+device_number() {
+    local numbers major minor
+    numbers=$(command stat -Lc '%t:%T' -- "$1") || return 1
+    [[ $numbers =~ ^([[:xdigit:]]+):([[:xdigit:]]+)$ ]] || return 1
+    major=${BASH_REMATCH[1]} minor=${BASH_REMATCH[2]}
+    printf '%d:%d\n' "$((16#$major))" "$((16#$minor))"
+}
+parent_disk() {
+    local name
+    name=$(command lsblk --noheadings --nodeps --output PKNAME -- "$1") || return 1
+    [[ $name =~ ^sd[a-z]+$ ]] || return 1
+    printf '/dev/%s\n' "$name"
+}
+byid_for_device() {
+    local device=$1 link resolved first=
+    for link in /dev/disk/by-id/wwn-* /dev/disk/by-id/ata-* /dev/disk/by-id/scsi-*; do
+        [[ -L $link && $link != *-part[0-9]* ]] || continue
+        resolved=$(canonical_device "$link" 2>/dev/null) || continue
+        if [[ $resolved == "$device" ]]; then first=$link; break; fi
+    done
+    printf '%s\n' "${first:--}"
+}
+supplement_identity() {
+    [[ -n $ROW_SERIAL && -n $ROW_WWN ]] && return 0
+    command -v udevadm >/dev/null 2>&1 || return 0
+    local properties key value
+    properties=$(command udevadm info --query=property --name="/dev/$ROW_NAME" 2>/dev/null) || return 0
+    while IFS='=' read -r key value; do
+        case $key in
+            ID_SERIAL_SHORT) [[ -n $ROW_SERIAL ]] || ROW_SERIAL=$value ;;
+            ID_WWN) [[ -n $ROW_WWN ]] || ROW_WWN=$value ;;
+        esac
+    done <<< "$properties"
+}
+
+collect_disks() {
+    local rows row i=0
+    DISK_NAMES=() DISK_SIZES=() DISK_MODELS=() DISK_SERIALS=() DISK_WWNS=()
+    DISK_NUMBERS=() DISK_SECTORS=() DISK_BYIDS=() DISK_POOLS=() DISK_STATES=()
+    INVENTORY_WARNING=
+    rows=$(read_block_rows) || { error '디스크 정보를 조회할 수 없습니다.'; return 1; }
+    while IFS= read -r row; do
+        [[ -n $row ]] || continue
+        parse_block_row "$row" || { error 'lsblk 정보 형식을 해석할 수 없습니다.'; return 1; }
+        [[ $ROW_NAME =~ ^sd[a-z]+$ && $ROW_TYPE == disk ]] || continue
+        supplement_identity
+        DISK_NAMES[i]=$ROW_NAME DISK_SIZES[i]=$ROW_SIZE DISK_MODELS[i]=$ROW_MODEL
+        DISK_SERIALS[i]=$ROW_SERIAL DISK_WWNS[i]=$ROW_WWN DISK_NUMBERS[i]=$ROW_NUMBER
+        DISK_SECTORS[i]=$ROW_SECTOR DISK_BYIDS[i]=$(byid_for_device "/dev/$ROW_NAME")
+        DISK_POOLS[i]=- DISK_STATES[i]=N/A
+        ((i+=1))
+    done <<< "$rows"
+    map_pools
+}
+
+map_pools() {
+    local output line pool= config=0 node state rest resolved parent i unresolved=0
+    if ! output=$(read_pool_status 2>&1); then
+        INVENTORY_WARNING="ZFS 상태 조회 실패: $(safe_text "$output")"
+        for ((i=0; i<${#DISK_NAMES[@]}; i++)); do
+            DISK_POOLS[i]=UNKNOWN DISK_STATES[i]=UNKNOWN
+        done
+        return 0
+    fi
+    while IFS= read -r line; do
+        read -r node state rest <<< "$line"
+        case $node in
+            pool:) pool=$state; config=0; continue ;;
+            config:) config=1; continue ;;
+            errors:) config=0; continue ;;
+        esac
+        (( config )) && [[ -n $pool ]] || continue
+        case $state in ONLINE|OFFLINE|DEGRADED|FAULTED|UNAVAIL|REMOVED|AVAIL|INUSE) ;; *) continue ;; esac
+        [[ $node != "$pool" ]] || continue
+        case $node in mirror-*|raidz*|draid*|replacing-*|spare-*) continue ;; esac
+        if [[ $node != /dev/* ]]; then unresolved=1; continue; fi
+        resolved=$(canonical_device "$node" 2>/dev/null) || { unresolved=1; continue; }
+        if [[ $resolved =~ ^/dev/sd[a-z]+$ ]]; then
+            parent=$resolved
+        else
+            parent=$(parent_disk "$resolved" 2>/dev/null) || { unresolved=1; continue; }
+        fi
+        for ((i=0; i<${#DISK_NAMES[@]}; i++)); do
+            [[ /dev/${DISK_NAMES[i]} == "$parent" ]] || continue
+            if [[ ${DISK_POOLS[i]} == - ]]; then
+                DISK_POOLS[i]=$pool DISK_STATES[i]=$state
+            else
+                DISK_POOLS[i]+=",$pool" DISK_STATES[i]+=",$state"
+            fi
+        done
+    done <<< "$output"
+    if (( unresolved )); then
+        INVENTORY_WARNING='ZFS의 일부 장치를 연결할 수 없습니다. 미확인 디스크 상태는 UNKNOWN입니다.'
+        for ((i=0; i<${#DISK_NAMES[@]}; i++)); do
+            if [[ ${DISK_POOLS[i]} == - ]]; then DISK_POOLS[i]=UNKNOWN DISK_STATES[i]=UNKNOWN; fi
+        done
+    fi
+}
+
+select_target() {
+    local target=$1 i selected=-1 matches=0 canonical
+    if [[ $target == /* ]]; then
+        [[ $target =~ ^/dev/sd[a-z]+$ ]] || { error '전체 디스크 /dev/sdX 경로만 지원합니다.'; return 1; }
+        canonical=$(canonical_device "$target") || return 1
+        [[ $canonical == "$target" ]] && device_is_block "$canonical" || return 1
+        for ((i=0; i<${#DISK_NAMES[@]}; i++)); do
+            [[ /dev/${DISK_NAMES[i]} != "$canonical" ]] || selected=$i
+        done
+    else
+        for ((i=0; i<${#DISK_NAMES[@]}; i++)); do
+            if [[ -n ${DISK_SERIALS[i]} && ${DISK_SERIALS[i]} == "$target" ]]; then
+                selected=$i; ((matches+=1))
+            fi
+        done
+        (( matches <= 1 )) || { error 'Serial이 중복되어 디스크를 선택할 수 없습니다.'; return 1; }
+    fi
+    (( selected >= 0 )) || { error "디스크를 찾을 수 없습니다: $(safe_text "$target")"; return 1; }
+    SELECT_NAME=/dev/${DISK_NAMES[selected]} SELECT_SIZE=${DISK_SIZES[selected]}
+    SELECT_MODEL=${DISK_MODELS[selected]} SELECT_SERIAL=${DISK_SERIALS[selected]}
+    SELECT_WWN=${DISK_WWNS[selected]} SELECT_NUMBER=${DISK_NUMBERS[selected]}
+    SELECT_SECTOR=${DISK_SECTORS[selected]} SELECT_BYID=${DISK_BYIDS[selected]}
+    SELECT_POOL=${DISK_POOLS[selected]} SELECT_STATE=${DISK_STATES[selected]}
+    [[ -n $SELECT_SERIAL || -n $SELECT_WWN ]] || { error 'Serial과 WWN을 확인할 수 없습니다.'; return 1; }
+    if [[ -n $SELECT_SERIAL ]]; then
+        matches=0
+        for ((i=0; i<${#DISK_NAMES[@]}; i++)); do
+            [[ ${DISK_SERIALS[i]} != "$SELECT_SERIAL" ]] || ((matches+=1))
+        done
+        (( matches == 1 )) || { error 'Serial이 중복되어 디스크를 선택할 수 없습니다.'; return 1; }
+    fi
+}
+
+revalidate_target() {
+    local resolved number row
+    resolved=$(canonical_device "$SELECT_NAME") || { error '선택한 장치가 사라졌습니다.'; return 1; }
+    [[ $resolved == "$SELECT_NAME" ]] && device_is_block "$resolved" || {
+        error '선택한 경로가 같은 전체 디스크가 아닙니다.'; return 1;
+    }
+    number=$(device_number "$resolved") || return 1
+    row=$(read_block_rows "$resolved") || return 1
+    parse_block_row "$row" || return 1
+    supplement_identity
+    [[ $ROW_TYPE == disk && /dev/$ROW_NAME == "$SELECT_NAME" &&
+       $number == "$SELECT_NUMBER" && $ROW_NUMBER == "$SELECT_NUMBER" &&
+       $ROW_SERIAL == "$SELECT_SERIAL" && $ROW_WWN == "$SELECT_WWN" &&
+       $ROW_SIZE == "$SELECT_SIZE" && $ROW_SECTOR == "$SELECT_SECTOR" ]] || {
+        error '장치 정보가 변경되었습니다. 목록에서 다시 선택하세요.'; return 1;
+    }
+}
+
+human_size() {
+    local bytes=$1
+    [[ $bytes =~ ^[0-9]+$ && ${#bytes} -le 18 ]] || { printf 'UNKNOWN'; return; }
+    bytes=$((10#$bytes))
+    if (( bytes >= 1099511627776 )); then printf '%d.%d TiB' "$((bytes/1099511627776))" "$((bytes%1099511627776*10/1099511627776))"
+    elif (( bytes >= 1073741824 )); then printf '%d.%d GiB' "$((bytes/1073741824))" "$((bytes%1073741824*10/1073741824))"
+    else printf '%d MiB' "$((bytes/1048576))"; fi
+}
+show_details() {
+    printf '\n'
+    local label value
+    for label in NAME SIZE MODEL SERIAL WWN POOL STATE BYID; do
+        case $label in
+            NAME) value=$SELECT_NAME ;; SIZE) value=$(human_size "$SELECT_SIZE") ;;
+            MODEL) value=$SELECT_MODEL ;; SERIAL) value=$SELECT_SERIAL ;;
+            WWN) value=$SELECT_WWN ;; POOL) value=$SELECT_POOL ;;
+            STATE) value=$SELECT_STATE ;; BYID) value=$SELECT_BYID ;;
+        esac
+        [[ $label != NAME ]] || label=Device
+        printf '%-8s : %s\n' "$label" "$(safe_text "${value:-UNKNOWN}")"
+    done
+    printf '읽기 설정: %s MiB / 휴지 %s초\n' "$READ_MIB" "$INTERVAL"
+    if [[ $SELECT_POOL == UNKNOWN || $SELECT_STATE == UNKNOWN ]]; then
+        printf 'ZFS 상태가 미확인입니다. 교체 판단은 TrueNAS에서 확인하세요.\n'
+    fi
+}
+show_list() {
+    local i
+    printf 'DEVICE\tSIZE\tMODEL\tSERIAL\tWWN\tPOOL\tSTATE\tBY-ID\n'
+    for ((i=0; i<${#DISK_NAMES[@]}; i++)); do
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${DISK_NAMES[i]}" \
+            "$(human_size "${DISK_SIZES[i]}")" "$(safe_text "${DISK_MODELS[i]:-UNKNOWN}")" \
+            "$(safe_text "${DISK_SERIALS[i]:-UNKNOWN}")" "$(safe_text "${DISK_WWNS[i]:-UNKNOWN}")" \
+            "$(safe_text "${DISK_POOLS[i]}")" "$(safe_text "${DISK_STATES[i]}")" \
+            "$(safe_text "${DISK_BYIDS[i]}")"
+    done
+    [[ -z $INVENTORY_WARNING ]] || printf '%s\n' "$INVENTORY_WARNING" >&2
+}
+
+require_root() {
+    (( EUID == 0 )) || { error '식별에는 root 권한이 필요합니다. sudo /bin/bash disk-locate로 실행하세요.'; return 1; }
+}
+check_runtime() {
+    local name os version
+    [[ -r /proc/sys/kernel/ostype && -d /sys/class/block ]] || { error 'TrueNAS SCALE/Linux에서 실행하세요.'; return 1; }
+    IFS= read -r os < /proc/sys/kernel/ostype
+    [[ $os == Linux ]] || return 1
+    for name in lsblk readlink stat dd sleep; do
+        command -v "$name" >/dev/null 2>&1 || { error "기본 도구가 없습니다: $name"; return 1; }
+    done
+    version=$(command dd --version 2>/dev/null)
+    [[ $version == *'GNU coreutils'* ]] || { error 'GNU dd가 필요합니다. 별도 도구를 자동 설치하지 않습니다.'; return 1; }
+    command stat -Lc '%t:%T' /dev/null >/dev/null 2>&1 || { error 'GNU stat의 장치 번호 조회가 필요합니다.'; return 1; }
+}
+
+fd_position() {
+    local key value rest
+    while read -r key value rest; do
+        if [[ $key == pos: && $value =~ ^[0-9]+$ && ${#value} -le 18 ]]; then
+            printf '%s\n' "$value"; return 0
+        fi
+    done < "/proc/$$/fdinfo/3"
+    return 1
+}
+open_selected_device() {
+    local number
+    [[ $SELECT_SIZE =~ ^[1-9][0-9]*$ && ${#SELECT_SIZE} -le 18 &&
+       $SELECT_SECTOR =~ ^[1-9][0-9]*$ && ${#SELECT_SECTOR} -le 7 ]] || {
+        error '디스크 크기와 sector 크기를 확인할 수 없습니다.'; return 1;
+    }
+    (( 1048576 % SELECT_SECTOR == 0 )) || { error 'direct read 정렬을 지원하지 않는 sector 크기입니다.'; return 1; }
+    exec 3< "$SELECT_NAME" || { error '디스크를 읽기 전용으로 열 수 없습니다.'; return 1; }
+    FD_OPEN=1
+    device_is_block "/proc/$$/fd/3" || return 1
+    number=$(device_number "/proc/$$/fd/3") || return 1
+    [[ $number == "$SELECT_NUMBER" ]] || { error '열린 장치가 선택한 디스크와 다릅니다.'; return 1; }
+    revalidate_target
+}
+launch_burst() {
+    (( ! STOP_REQUESTED && ! SHUTDOWN )) || return 1
+    command dd of=/dev/null bs=1M count="$READ_MIB" iflag=direct,fullblock status=none <&3 &
+    ACTIVE_PID=$!
+}
+child_running() {
+    local line state parent rest
+    [[ -r /proc/$1/stat ]] || return 1
+    IFS= read -r line < "/proc/$1/stat" || return 1
+    line=${line##*) }
+    read -r state parent rest <<< "$line"
+    [[ $parent == "$$" && $state != Z && $state != X ]]
+}
+tick() {
+    command sleep 0.1 & POLL_PID=$!
+    wait "$POLL_PID" 2>/dev/null || :
+    if child_running "$POLL_PID"; then kill -TERM "$POLL_PID" 2>/dev/null || :; wait "$POLL_PID" 2>/dev/null || :; fi
+    POLL_PID=
+}
+read_key() {
+    KEY=
+    KEY_READY=0
+    local status
+    IFS= read -r -s -n 1 -t "$KEY_TIMEOUT" KEY
+    status=$?
+    (( status != 0 )) || KEY_READY=1
+    if (( status == 1 && BASH_VERSINFO[0] >= 4 )); then
+        SHUTDOWN=1 STOP_REQUESTED=1 STOP_REASON='입력이 종료되었습니다.'
+    fi
+    return 0
+}
+poll_controls() {
+    if [[ $MODE == tui ]]; then
+        read_key
+        case $KEY in q|Q) STOP_REQUESTED=1; STOP_REASON='사용자 요청' ;; esac
+    else
+        tick
+    fi
+}
+handle_signal() {
+    STOP_REQUESTED=1
+    case $1 in
+        INT)
+            STOP_REASON=Ctrl+C
+            if [[ $MODE != tui ]] || (( ! RUNNING )); then SHUTDOWN=1; EXIT_CODE=130; fi ;;
+        TERM) SHUTDOWN=1; EXIT_CODE=143; STOP_REASON=SIGTERM ;;
+        HUP) SHUTDOWN=1; EXIT_CODE=129; STOP_REASON=SIGHUP ;;
+    esac
+}
+cleanup_work() {
+    (( CLEANING )) && return 0
+    CLEANING=1
+    local pid i remaining=0
+    for pid in "$ACTIVE_PID" "$POLL_PID"; do
+        [[ -n $pid ]] || continue
+        if child_running "$pid"; then
+            kill -TERM "$pid" 2>/dev/null || :
+            for ((i=0; i<3; i++)); do child_running "$pid" || break; command sleep 0.1; done
+            if child_running "$pid"; then kill -KILL "$pid" 2>/dev/null || :; fi
+            for ((i=0; i<3; i++)); do child_running "$pid" || break; command sleep 0.1; done
+        fi
+        if child_running "$pid"; then
+            error "I/O 종료 대기 중인 프로세스가 남아 있습니다: PID=$pid"
+            remaining=1
+        else
+            wait "$pid" 2>/dev/null || :
+        fi
+    done
+    ACTIVE_PID= POLL_PID=
+    if (( FD_OPEN )); then exec 3<&-; FD_OPEN=0; fi
+    CLEANING=0
+    if (( remaining )); then SHUTDOWN=1; EXIT_CODE=1; return 1; fi
+}
+on_exit() { cleanup_work || :; }
+install_traps() {
+    trap 'handle_signal INT' INT
+    trap 'handle_signal TERM' TERM
+    trap 'handle_signal HUP' HUP
+    trap on_exit EXIT
+}
+
+run_locate() {
+    local before after burst_start started status result=0
+    (( ! SHUTDOWN )) || return 1
+    require_root || return 1
+    revalidate_target || return 1
+    STOP_REQUESTED=0 STOP_REASON= RUNNING=1
+    if ! open_selected_device; then RUNNING=0; cleanup_work; return 1; fi
+    started=$SECONDS
+    printf '\n식별 시작: %s / Serial %s\n' "$SELECT_NAME" "$(safe_text "${SELECT_SERIAL:-UNKNOWN}")"
+    printf '중단: %s\n' "$([[ $MODE == tui ]] && printf 'q 또는 Ctrl+C' || printf 'Ctrl+C')"
+    while (( ! STOP_REQUESTED && ! SHUTDOWN )); do
+        revalidate_target || { STOP_REASON='장치 소실 또는 식별 정보 변경'; result=1; break; }
+        (( ! STOP_REQUESTED && ! SHUTDOWN )) || break
+        before=$(fd_position) || { STOP_REASON='읽기 위치 확인 실패'; result=1; break; }
+        (( ! STOP_REQUESTED && ! SHUTDOWN )) || break
+        if (( before + READ_MIB * 1048576 > SELECT_SIZE )); then STOP_REASON='디스크 읽기 범위 끝'; break; fi
+        printf '\r읽는 중 | 경과 %s초 | %s MiB / 휴지 %s초    ' "$((SECONDS-started))" "$READ_MIB" "$INTERVAL"
+        burst_start=$SECONDS
+        (( ! STOP_REQUESTED && ! SHUTDOWN )) || break
+        launch_burst || break
+        while child_running "$ACTIVE_PID" && (( ! STOP_REQUESTED && ! SHUTDOWN )); do
+            if (( SECONDS - burst_start >= 10 )); then
+                STOP_REQUESTED=1 STOP_REASON='읽기 시간 제한(10초) 초과'; result=1; break
+            fi
+            poll_controls
+        done
+        (( ! STOP_REQUESTED && ! SHUTDOWN )) || break
+        wait "$ACTIVE_PID"; status=$?; ACTIVE_PID=
+        if (( status != 0 )); then STOP_REASON='읽기 오류. 추가 읽기를 중단합니다.'; result=1; break; fi
+        after=$(fd_position) || { STOP_REASON='읽기 위치 확인 실패'; result=1; break; }
+        (( ! STOP_REQUESTED && ! SHUTDOWN )) || break
+        if (( after-before != READ_MIB*1048576 )); then STOP_REASON='예상보다 짧은 읽기. 추가 읽기를 중단합니다.'; result=1; break; fi
+        printf '\r쉬는 중 | 경과 %s초 | %s MiB / 휴지 %s초    ' "$((SECONDS-started))" "$READ_MIB" "$INTERVAL"
+        (( ! STOP_REQUESTED && ! SHUTDOWN )) || break
+        command sleep "$INTERVAL" & ACTIVE_PID=$!
+        while child_running "$ACTIVE_PID" && (( ! STOP_REQUESTED && ! SHUTDOWN )); do poll_controls; done
+        (( ! STOP_REQUESTED && ! SHUTDOWN )) || break
+        wait "$ACTIVE_PID"; status=$?; ACTIVE_PID=
+        if (( status != 0 )); then STOP_REASON='휴지 작업 오류'; result=1; break; fi
+    done
+    printf '\n정리 중...\n'
+    cleanup_work || result=1
+    RUNNING=0
+    LAST_MESSAGE="식별 중단: $SELECT_NAME / Serial $(safe_text "${SELECT_SERIAL:-UNKNOWN}") — ${STOP_REASON:-작업 종료}"
+    printf '%s\n' "$LAST_MESSAGE"
+    return "$result"
+}
+
+screen_header() {
+    if [[ -t 1 ]]; then
+        case ${TERM:-dumb} in xterm*|screen*|tmux*|vt100|linux) printf '\033[2J\033[H' ;; esac
+    fi
+    printf 'Disk Locator · TrueNAS SCALE 24.10\n'
+    printf '────────────────────────────────────────────────────────────\n'
+}
+menu_input() {
+    local digits=
+    MENU_INPUT=
+    while (( ! SHUTDOWN )); do
+        read_key
+        (( KEY_READY )) || continue
+        case $KEY in
+            [0-9]) if (( ${#digits} < 6 )); then digits+=$KEY; printf '%s' "$KEY"; fi ;;
+            $'\177'|$'\b') if [[ -n $digits ]]; then digits=${digits%?}; printf '\b \b'; fi ;;
+            r|R|q|Q|s|S|b|B) MENU_INPUT=${KEY}; printf '\n'; return 0 ;;
+            '') if [[ -n $digits ]]; then MENU_INPUT=$digits; printf '\n'; return 0; fi ;;
+        esac
+    done
+    return 1
+}
+run_tui() {
+    local i index notice=
+    while (( ! SHUTDOWN )); do
+        collect_disks || return 1
+        screen_header
+        [[ -z $LAST_MESSAGE ]] || printf '%s\n\n' "$LAST_MESSAGE"
+        [[ -z $notice ]] || printf '%s\n\n' "$notice"
+        printf '%-3s %-6s %-10s %-22s %-12s %s\n' '#' DEVICE SIZE SERIAL POOL STATE
+        for ((i=0; i<${#DISK_NAMES[@]}; i++)); do
+            printf '%-3s %-6s %-10s %-22s %-12s %s\n' "$((i+1))" "${DISK_NAMES[i]}" \
+                "$(human_size "${DISK_SIZES[i]}")" "$(safe_text "${DISK_SERIALS[i]:-UNKNOWN}")" \
+                "$(safe_text "${DISK_POOLS[i]}")" "$(safe_text "${DISK_STATES[i]}")"
+        done
+        (( ${#DISK_NAMES[@]} )) || printf '지원하는 SATA/SAS 디스크가 없습니다.\n'
+        [[ -z $INVENTORY_WARNING ]] || printf '\n%s\n' "$INVENTORY_WARNING"
+        (( EUID == 0 )) || printf '\n조회 전용: 식별 시작에는 root 권한이 필요합니다.\n'
+        printf '\n번호 입력 후 Enter   [r] 새로고침   [q] 종료\n> '
+        menu_input || break
+        case $MENU_INPUT in q|Q) break ;; r|R) notice=; continue ;; esac
+        if [[ ! $MENU_INPUT =~ ^[0-9]+$ ]] || (( ${#MENU_INPUT} > 6 )); then notice='올바른 번호를 선택하세요.'; continue; fi
+        index=$((10#$MENU_INPUT-1))
+        if (( index < 0 || index >= ${#DISK_NAMES[@]} )); then notice='목록 범위의 번호를 선택하세요.'; continue; fi
+        if ! select_target "/dev/${DISK_NAMES[index]}" || ! revalidate_target; then notice='선택할 수 없습니다. 디스크 정보를 다시 확인하세요.'; continue; fi
+        notice=
+        while (( ! SHUTDOWN )); do
+            screen_header
+            show_details
+            if (( EUID == 0 )); then printf '\n[s] 식별 시작   [b] 목록   [q] 종료\n> '
+            else printf '\n조회 전용: sudo /bin/bash disk-locate로 실행하세요.\n[b] 목록   [q] 종료\n> '; fi
+            menu_input || break
+            case $MENU_INPUT in
+                b|B) break ;;
+                q|Q) SHUTDOWN=1; break ;;
+                s|S)
+                    if ! require_root; then notice='식별 시작에는 root 권한이 필요합니다.'; break; fi
+                    run_locate || notice='식별 작업에 오류가 있었습니다. 위 종료 사유를 확인하세요.'
+                    break ;;
+            esac
+        done
+    done
+    return "$EXIT_CODE"
+}
+
+main() {
+    parse_args "$@" || return $?
+    case $MODE in help) help; return 0 ;; version) printf 'disk-locate %s\n' "$VERSION"; return 0 ;; esac
+    if [[ $MODE == tui ]] && { [[ ! -t 0 ]] || [[ ! -t 1 ]]; }; then
+        error 'TUI에는 terminal이 필요합니다. list 또는 Serial을 지정하세요.'
+        help; return 2
+    fi
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin
+    export PATH LC_ALL=C
+    check_runtime || return 1
+    install_traps
+    if [[ $MODE == tui ]]; then run_tui; return $?; fi
+    collect_disks || return 1
+    [[ $MODE != list ]] || { show_list; return 0; }
+    select_target "$TARGET" || return 1
+    show_details
+    [[ $TARGET != /dev/* ]] || printf '장치 경로는 변경될 수 있습니다. Serial과 WWN을 확인하세요.\n'
+    run_locate
+    local result=$?
+    (( EXIT_CODE == 0 )) || return "$EXIT_CODE"
+    return "$result"
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+    exit $?
+fi

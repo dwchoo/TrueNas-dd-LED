@@ -1,0 +1,23 @@
+  pool: tank
+ state: DEGRADED
+status: One or more devices has been taken offline by the administrator.
+config:
+
+        NAME                              STATE     READ WRITE CKSUM
+        tank                              DEGRADED     0     0     0
+          mirror-0                        DEGRADED     0     0     0
+            /dev/disk/by-id/ata-A          ONLINE       0     0     0
+            /dev/disk/by-partuuid/part-B   OFFLINE      0     0     0
+          1234567890123456789              UNAVAIL      0     0     0  was /dev/sdz1
+
+errors: No known data errors
+
+  pool: archive
+ state: ONLINE
+config:
+
+        NAME                              STATE     READ WRITE CKSUM
+        archive                           ONLINE       0     0     0
+          /dev/sda2                       ONLINE       0     0     0
+
+errors: No known data errors
