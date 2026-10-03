@@ -11,31 +11,21 @@ TrueNAS SCALE에서 대상 디스크에 읽기 I/O를 발생시켜 Hot-swap Bay�
 - SES Locate 기능 없이 Activity LED로 디스크를 식별하는 환경.
 - 사용자가 기존 `dd` 읽기로 Activity LED 점멸을 확인했다. 케이스와 백플레인 모델은 미확인이다.
 
-## 실행 방식
+## 바로 실행하기
 
 추가 패키지 설치 없이 TrueNAS에 이미 있는 Bash와 기본 명령을 사용하도록 작성했다. 저장소의 `disk-locate` 파일 하나만 영속 dataset에 복사하고 신뢰할 수 있는 관리자 shell에서 실행한다. 스크립트와 dataset을 포함한 모든 상위 디렉터리는 일반 공유 사용자가 수정할 수 없는 경로로 관리한다.
 
-아래 예시는 Pool 이름이 `tank`이고, 스크립트를 `/mnt/tank/scripts/disk-locate`에 복사한 경우다. 예시 Serial `ZL333333`과 장치 경로 `/dev/sdc`는 실제 목록에서 확인한 값으로 바꾼다. LED 식별은 root 권한이 필요하며, 이미 root로 접속했다면 `sudo`를 생략할 수 있다.
+아래 예시는 Pool 이름이 `tank`이고, 스크립트를 `/mnt/tank/scripts/disk-locate`에 복사한 경우다. `tank`는 실제 Pool 이름으로 바꾼다. **프로그램 인자 없이 실행하면 바로 TUI의 디스크 목록이 열린다.** Serial이나 장치 경로를 입력하지 않고 화면에서 번호를 선택한다. LED 식별은 root 권한이 필요하며, 이미 root로 접속했다면 `sudo`를 생략할 수 있다.
 
 ```bash
 sudo /bin/bash /mnt/tank/scripts/disk-locate
-sudo /bin/bash /mnt/tank/scripts/disk-locate list
-sudo /bin/bash /mnt/tank/scripts/disk-locate ZL333333
-sudo /bin/bash /mnt/tank/scripts/disk-locate /dev/sdc
-sudo /bin/bash /mnt/tank/scripts/disk-locate --read-size 8M --interval 1
-/bin/bash /mnt/tank/scripts/disk-locate --help
 ```
+
+스크립트가 있는 폴더에서는 `sudo /bin/bash ./disk-locate`로 실행해도 된다. 실행 후 `번호 + Enter → 상세 정보 → s로 시작 → q 또는 Ctrl+C로 중단 → 목록 복귀` 순서로 사용한다.
 
 NAS에 패키지, Git, `pip`, Docker 또는 Developer Mode를 준비할 필요가 없다. `/bin/bash`로 실행하므로 실행 권한 부여나 PATH 등록도 필수는 아니다. 일반 사용자는 권한 범위에서 목록을 조회할 수 있으며, TUI 안에서 `sudo`를 자동 실행하지 않는다.
 
-Linux의 Bash, GNU `dd`, `lsblk`, `readlink`, GNU `stat`, `sleep`을 사용한다. `zpool` 조회 실패는 상태를 `UNKNOWN`으로 표시한다. 기본 도구가 없으면 자동 설치하지 않고 실행을 중단한다.
-
-| 옵션 | 기본값 | 허용 범위 |
-| --- | --- | --- |
-| `--read-size` | `64M` | `1M`부터 `64M`까지 정수 MiB |
-| `--interval` | `1` | 읽기 완료 후 1부터 10까지 정수 초 |
-
-기본 동작은 64 MiB 읽기와 1초 휴지를 반복한다. 첫 실기 확인은 `--read-size 8M`부터 시작하고 LED 식별이 충분하면 작은 값을 사용한다. 대상 없이 옵션만 지정해도 해당 설정으로 TUI를 연다.
+Linux의 Bash, GNU `dd`, `lsblk`, `readlink`, GNU `stat`, `sleep`을 사용한다. `zpool` 조회 실패는 상태를 `UNKNOWN`으로 표시한다. 기본 도구가 없으면 자동 설치하지 않고 실행을 중단한다. 기본 읽기 설정은 64 MiB burst와 1초 휴지다.
 
 ## TUI 사용 흐름
 
@@ -61,6 +51,24 @@ Disk Locator · TrueNAS SCALE 24.10
 - 화면의 번호는 목록 선택용이며 물리 베이 번호가 아니다.
 
 Bash의 `read`, `printf`로 구현하므로 `dialog`, `whiptail`, `curses`, `fzf` 설치가 필요 없다. 인자 없는 TUI 실행에는 terminal 입출력이 필요하다. `list`, Serial 또는 `/dev/sdX`를 지정하면 TUI에 진입하지 않고 CLI로 동작하며, CLI의 Ctrl+C는 읽기를 중단하고 프로그램을 종료한다.
+
+## 선택적으로 사용하는 CLI와 옵션
+
+일반적인 식별 작업은 위 TUI에서 수행한다. 목록만 출력하거나 디스크를 직접 지정하고 싶을 때 다음 CLI를 사용할 수 있다. 예시 Serial `ZL333333`과 `/dev/sdc`는 실제 목록에서 확인한 값으로 바꾼다.
+
+```bash
+sudo /bin/bash /mnt/tank/scripts/disk-locate list
+sudo /bin/bash /mnt/tank/scripts/disk-locate ZL333333
+sudo /bin/bash /mnt/tank/scripts/disk-locate /dev/sdc
+/bin/bash /mnt/tank/scripts/disk-locate --help
+```
+
+| 옵션 | 기본값 | 허용 범위 |
+| --- | --- | --- |
+| `--read-size` | `64M` | `1M`부터 `64M`까지 정수 MiB |
+| `--interval` | `1` | 읽기 완료 후 1부터 10까지 정수 초 |
+
+필요하면 `--read-size 8M --interval 1`처럼 설정을 조절할 수 있다. 옵션은 필수가 아니며, 대상 없이 옵션만 지정해도 TUI를 연다. 최초 실기 확인에서 읽기 부담을 줄이고 싶다면 8 MiB로 시작해 LED 식별 여부를 확인한다.
 
 ## 동작 원칙
 
